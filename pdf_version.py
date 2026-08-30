@@ -1,7 +1,7 @@
+import inspect
 import io
 import json
 import math
-import re
 from pathlib import Path
 
 import cv2
@@ -10,8 +10,8 @@ import pandas as pd
 import pypdfium2 as pdfium
 import requests
 import streamlit as st
-
 from PIL import Image
+
 from paddleocr import PaddleOCR
 
 from openpyxl import Workbook
@@ -19,16 +19,10 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A3, A4, landscape
+from reportlab.lib.pagesizes import A3, landscape
 from reportlab.lib.units import mm
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Table,
-    TableStyle,
-    Paragraph,
-    Spacer,
-)
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 
 # ============================================================
@@ -36,362 +30,318 @@ from reportlab.platypus import (
 # ============================================================
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-DEFAULT_OLLAMA_MODEL = "gemma3:12b"
+OLLAMA_MODEL = "gemma3:12b"
 
-PDF_RENDER_SCALE = 3.0
-MAX_IMAGE_WIDTH = 3500
-
-MIN_LINE_LENGTH_RATIO = 0.12
-ATTENDANCE_MARK_BLACK_RATIO = 0.012
-
-
-# ============================================================
-# STREAMLIT
-# ============================================================
+# PaddleOCR language codes. PaddleOCR bundles several Latin languages
+# (French/German/Spanish/etc.) under a shared "latin" model, and several
+# others (Malay/Indonesian/Swahili/etc.) under a few other shared packs.
+# See https://github.com/PaddlePaddle/PaddleOCR for the full list — this
+# covers the ones people actually digitize attendance sheets in.
+LANGUAGE_OPTIONS = {
+    "English": "en",
+    "Arabic": "arabic",
+    "Chinese (Simplified)": "ch",
+    "Chinese (Traditional)": "chinese_cht",
+    "French": "french",
+    "German": "german",
+    "Spanish / Portuguese / Italian (Latin script)": "latin",
+    "Korean": "korean",
+    "Japanese": "japan",
+    "Russian / Ukrainian (Cyrillic)": "cyrillic",
+    "Hindi / Marathi / Nepali (Devanagari)": "devanagari",
+    "Tamil": "ta",
+    "Telugu": "te",
+    "Kannada": "ka",
+    "Vietnamese": "vi",
+}
 
 st.set_page_config(
-    page_title="Attendance Sheet Digitizer",
+    page_title="Document Digitizer",
     page_icon="📋",
     layout="wide",
 )
 
-st.title("📋 Attendance Sheet Digitizer")
-
-st.caption(
-    "Scan attendance sheets → detect structure → extract names & attendance → "
-    "review → export Excel / CSV / recreated printable PDF"
-)
+st.title("📋 Attendance / Ledger Digitizer")
+st.caption("PaddleOCR + OpenCV + Ollama → Excel / CSV / PDF")
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
+def streamlit_supports_param(func, param_name):
+    try:
+        return param_name in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
 
-if "pages" not in st.session_state:
-    st.session_state.pages = []
 
-if "results" not in st.session_state:
-    st.session_state.results = []
+def st_image_compat(*args, use_container_width=True, **kwargs):
+    if use_container_width and streamlit_supports_param(st.image, "use_container_width"):
+        kwargs["use_container_width"] = True
+    return st.image(*args, **kwargs)
+
+
+def st_button_compat(*args, use_container_width=True, **kwargs):
+    if use_container_width and streamlit_supports_param(st.button, "use_container_width"):
+        kwargs["use_container_width"] = True
+    return st.button(*args, **kwargs)
+
+
+def st_data_editor_compat(*args, use_container_width=True, **kwargs):
+    if use_container_width and streamlit_supports_param(st.data_editor, "use_container_width"):
+        kwargs["use_container_width"] = True
+    return st.data_editor(*args, **kwargs)
+
+
+def st_download_button_compat(*args, use_container_width=True, **kwargs):
+    if use_container_width and streamlit_supports_param(st.download_button, "use_container_width"):
+        kwargs["use_container_width"] = True
+    return st.download_button(*args, **kwargs)
 
 
 # ============================================================
 # OCR
 # ============================================================
 
-@st.cache_resource
-def load_ocr():
+@st.cache_resource(show_spinner="Loading PaddleOCR model (first run downloads weights)...")
+def get_ocr(lang: str = "en"):
+    """
+    Cached per-language so switching languages in the sidebar loads a
+    fresh model instead of silently reusing the wrong one.
+
+    PaddleOCR's constructor kwargs have changed across major versions
+    (use_angle_cls -> use_textline_orientation, show_log removed, etc.).
+    Try the modern signature first and fall back to the older one so this
+    keeps working regardless of which PaddleOCR version is installed.
+    """
     try:
         return PaddleOCR(
-            lang="en",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
             use_textline_orientation=True,
+            lang=lang,
         )
-    except Exception:
+    except TypeError:
+        return PaddleOCR(
+            use_angle_cls=True,
+            lang=lang,
+            show_log=False,
+        )
+
+
+def _flatten_paddle_result(result):
+    """
+    PaddleOCR's return shape has varied across versions:
+      - list of [box, (text, score)] per detected line (det=True)
+      - list of (text, score) tuples (det=False, recognition-only)
+      - newer versions wrap everything in a dict-like OCRResult object
+        with 'rec_texts' / 'rec_scores' / 'rec_polys' keys.
+    Normalize all of these into a flat list of (text, score, box|None).
+    """
+    out = []
+
+    if result is None:
+        return out
+
+    # Newer (PaddleX-based) OCRResult: dict-like with rec_texts/rec_scores
+    if hasattr(result, "get") or isinstance(result, dict):
         try:
-            return PaddleOCR(
-                lang="en",
-                use_angle_cls=True,
-            )
+            texts = result.get("rec_texts", []) or []
+            scores = result.get("rec_scores", []) or []
+            polys = result.get("rec_polys", result.get("dt_polys", [])) or []
+            for i, text in enumerate(texts):
+                score = scores[i] if i < len(scores) else 0.0
+                box = polys[i] if i < len(polys) else None
+                out.append((str(text).strip(), float(score), box))
+            return out
         except Exception:
-            return PaddleOCR(lang="en")
+            pass
 
-
-def polygon_to_box(poly):
-    p = np.asarray(poly)
-
-    xs = p[:, 0]
-    ys = p[:, 1]
-
-    return [
-        int(xs.min()),
-        int(ys.min()),
-        int(xs.max()),
-        int(ys.max()),
-    ]
-
-
-def normalize_paddle_result(result):
-    words = []
-
-    try:
-        result_dict = result.res
-
-        texts = result_dict.get("rec_texts", [])
-        scores = result_dict.get("rec_scores", [])
-
-        polygons = (
-            result_dict.get("rec_polys")
-            or result_dict.get("dt_polys")
-            or []
-        )
-
-        for text, score, poly in zip(
-            texts,
-            scores,
-            polygons,
+    # Older list-based formats
+    for page in result:
+        if page is None:
+            continue
+        # det=False recognition-only single result: page == (text, score)
+        if (
+            isinstance(page, (list, tuple))
+            and len(page) == 2
+            and isinstance(page[0], str)
         ):
-            text = str(text).strip()
-
-            if not text:
-                continue
-
-            words.append(
-                {
-                    "text": text,
-                    "confidence": float(score),
-                    "box": polygon_to_box(poly),
-                }
-            )
-
-    except Exception:
-        pass
-
-    return words
-
-
-def run_ocr(ocr, image):
-    if len(image.shape) == 2:
-        rgb = cv2.cvtColor(
-            image,
-            cv2.COLOR_GRAY2RGB,
-        )
-    else:
-        rgb = image.copy()
-
-    # PaddleOCR 3.x
-    try:
-        results = ocr.predict(rgb)
-
-        words = []
-
-        for result in results:
-            words.extend(
-                normalize_paddle_result(result)
-            )
-
-        if words:
-            return words
-
-    except Exception as exc:
-        print("PaddleOCR predict fallback:", exc)
-
-    # Older PaddleOCR fallback
-    try:
-        results = ocr.ocr(rgb)
-
-        words = []
-
-        if not results:
-            return words
-
-        for page in results:
-            if not page:
-                continue
-
+            text, score = page
+            out.append((str(text).strip(), float(score), None))
+            continue
+        # det=True full pipeline: page is a list of [box, (text, score)]
+        if isinstance(page, (list, tuple)):
             for line in page:
-                box = line[0]
-                text = str(line[1][0]).strip()
-                score = float(line[1][1])
-
-                if not text:
+                try:
+                    box, (text, score) = line
+                    out.append((str(text).strip(), float(score), box))
+                except Exception:
                     continue
 
-                words.append(
-                    {
-                        "text": text,
-                        "confidence": score,
-                        "box": polygon_to_box(box),
-                    }
-                )
-
-        return words
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"PaddleOCR failed: {exc}"
-        )
+    return out
 
 
-def ocr_crop(
-    ocr,
-    image,
-    upscale=3.0,
-):
-    if image.size == 0:
-        return ""
+def ocr_words(model, img):
+    """Full-page OCR (detection + recognition) -> [{text, confidence, box}]
 
-    crop = image.copy()
+    Kept for cases where you need to OCR a *whole page* with unknown
+    layout. For pre-cropped cells with known boundaries, use
+    reco_batch() instead — it skips detection entirely and is much
+    faster.
+    """
 
-    h, w = crop.shape[:2]
+    if img is None or img.size == 0:
+        return []
 
-    if h < 5 or w < 5:
-        return ""
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
-    crop = cv2.resize(
-        crop,
-        None,
-        fx=upscale,
-        fy=upscale,
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    if len(crop.shape) == 3:
-        gray = cv2.cvtColor(
-            crop,
-            cv2.COLOR_RGB2GRAY,
-        )
-    else:
-        gray = crop
-
-    gray = cv2.GaussianBlur(
-        gray,
-        (3, 3),
-        0,
-    )
-
-    gray = cv2.normalize(
-        gray,
-        None,
-        0,
-        255,
-        cv2.NORM_MINMAX,
-    )
+    img = img.astype(np.uint8)
 
     try:
-        words = run_ocr(
-            ocr,
-            gray,
+        result = model.ocr(img, cls=True)
+    except TypeError:
+        result = model.ocr(img)
+
+    output = []
+
+    for text, confidence, box in _flatten_paddle_result(result):
+        if not text:
+            continue
+
+        if box is not None:
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
+        else:
+            bbox = [0, 0, img.shape[1], img.shape[0]]
+
+        output.append({
+            "text": text,
+            "confidence": float(confidence),
+            "box": bbox,
+        })
+
+    return output
+
+
+def reco_batch(model, crops):
+    """
+    Recognition-only OCR on a list of already-cropped cell images.
+
+    We already know exactly where each cell is (we cropped it
+    ourselves), so detection (the "det" step) is skipped entirely via
+    det=False — PaddleOCR treats the whole crop as one text line and
+    goes straight to recognition, which is far cheaper than running
+    full detection+recognition per cell.
+
+    Returns a list of strings, same length and order as `crops`.
+    Empty/invalid crops map to "".
+    """
+
+    results = []
+
+    for c in crops:
+
+        if c is None or c.size == 0:
+            results.append("")
+            continue
+
+        img = (
+            cv2.cvtColor(c, cv2.COLOR_GRAY2RGB)
+            if c.ndim == 2
+            else c
         )
-    except Exception:
-        return ""
 
-    words = sorted(
-        words,
-        key=lambda x: (
-            x["box"][1],
-            x["box"][0],
-        ),
-    )
+        img = cv2.resize(
+            img,
+            None,
+            fx=2,
+            fy=2,
+            interpolation=cv2.INTER_CUBIC,
+        ).astype(np.uint8)
 
-    return " ".join(
-        item["text"]
-        for item in words
-    ).strip()
+        text = ""
+
+        try:
+            try:
+                out = model.ocr(img, det=False, cls=False)
+            except TypeError:
+                out = model.ocr(img, det=False)
+
+            flat = _flatten_paddle_result(out)
+            if flat:
+                text = flat[0][0]
+        except Exception:
+            text = ""
+
+        results.append(text)
+
+    return results
 
 
 # ============================================================
-# INPUT FILES
+# FILE READING
 # ============================================================
 
-def pdf_to_images(data):
-    pdf = pdfium.PdfDocument(data)
+def read_file(file):
+    data = file.getvalue()
 
-    pages = []
+    if Path(file.name).suffix.lower() == ".pdf":
 
-    for i in range(len(pdf)):
-        page = pdf[i]
+        pdf = pdfium.PdfDocument(data)
 
-        rendered = page.render(
-            scale=PDF_RENDER_SCALE,
-        )
-
-        pil_image = (
-            rendered
-            .to_pil()
-            .convert("RGB")
-        )
-
-        pages.append(
-            np.array(pil_image)
-        )
-
-    return pages
-
-
-def uploaded_file_to_images(
-    uploaded_file,
-):
-    data = uploaded_file.getvalue()
-
-    suffix = (
-        Path(uploaded_file.name)
-        .suffix
-        .lower()
-    )
-
-    if suffix == ".pdf":
-        return pdf_to_images(data)
-
-    image = Image.open(
-        io.BytesIO(data)
-    ).convert("RGB")
+        return [
+            np.array(
+                pdf[i]
+                .render(scale=3)
+                .to_pil()
+                .convert("RGB")
+            )
+            for i in range(len(pdf))
+        ]
 
     return [
-        np.array(image)
+        np.array(
+            Image.open(io.BytesIO(data)).convert("RGB")
+        )
     ]
 
 
 # ============================================================
-# IMAGE PREPROCESSING
+# PREPROCESSING
 # ============================================================
 
-def resize_image(
-    image,
-    max_width=MAX_IMAGE_WIDTH,
-):
-    h, w = image.shape[:2]
-
-    if w <= max_width:
-        return image
-
-    scale = (
-        max_width
-        / float(w)
-    )
-
-    return cv2.resize(
-        image,
-        (
-            int(w * scale),
-            int(h * scale),
-        ),
-        interpolation=cv2.INTER_AREA,
-    )
-
-
-def deskew_image(image):
+def deskew(img):
     gray = cv2.cvtColor(
-        image,
+        img,
         cv2.COLOR_RGB2GRAY,
     )
 
-    edges = cv2.Canny(
-        gray,
-        50,
-        150,
-        apertureSize=3,
-    )
+    edges = cv2.Canny(gray, 50, 150)
 
     lines = cv2.HoughLinesP(
         edges,
         1,
         np.pi / 180,
-        threshold=100,
-        minLineLength=max(
-            100,
-            image.shape[1] // 4,
-        ),
+        100,
+        minLineLength=max(100, img.shape[1] // 4),
         maxLineGap=20,
     )
 
     if lines is None:
-        return image
+        return img
 
     angles = []
 
-    for line in lines[:, 0]:
-        x1, y1, x2, y2 = line
+    # FIXES numpy.int32 unpack error
+    for line in lines:
+
+        values = np.asarray(line).reshape(-1)
+
+        if values.size < 4:
+            continue
+
+        x1, y1, x2, y2 = map(
+            int,
+            values[:4],
+        )
 
         angle = math.degrees(
             math.atan2(
@@ -400,106 +350,92 @@ def deskew_image(image):
             )
         )
 
-        if abs(angle) < 12:
+        if abs(angle) < 10:
             angles.append(angle)
 
     if not angles:
-        return image
+        return img
 
-    angle = float(
-        np.median(angles)
-    )
+    angle = float(np.median(angles))
 
     if abs(angle) < 0.1:
-        return image
+        return img
 
-    h, w = image.shape[:2]
-
-    center = (
-        w // 2,
-        h // 2,
-    )
+    h, w = img.shape[:2]
 
     matrix = cv2.getRotationMatrix2D(
-        center,
+        (w / 2, h / 2),
         angle,
-        1.0,
+        1,
     )
 
-    rotated = cv2.warpAffine(
-        image,
+    return cv2.warpAffine(
+        img,
         matrix,
         (w, h),
-        flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE,
     )
 
-    return rotated
 
+def preprocess(img):
+    # Limit huge scans
+    h, w = img.shape[:2]
 
-def preprocess(image):
-    image = resize_image(image)
-    image = deskew_image(image)
+    if w > 3500:
+        scale = 3500 / w
+
+        img = cv2.resize(
+            img,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+
+    img = deskew(img)
 
     gray = cv2.cvtColor(
-        image,
+        img,
         cv2.COLOR_RGB2GRAY,
     )
 
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8),
-    )
+    gray = cv2.createCLAHE(
+        2,
+        (8, 8),
+    ).apply(gray)
 
-    gray = clahe.apply(gray)
-
-    return image, gray
+    return img, gray
 
 
 # ============================================================
-# GRID DETECTION
+# TABLE LINES
 # ============================================================
 
-def group_positions(
-    values,
-    tolerance=5,
-):
+def group(values, tolerance=5):
+    values = sorted(values)
+
     if not values:
         return []
 
-    values = sorted(values)
-
-    groups = [
-        [values[0]]
-    ]
+    groups = [[values[0]]]
 
     for value in values[1:]:
-        mean = np.mean(
-            groups[-1]
-        )
 
         if abs(
-            value - mean
+            value - np.mean(groups[-1])
         ) <= tolerance:
-            groups[-1].append(
-                value
-            )
+            groups[-1].append(value)
+
         else:
-            groups.append(
-                [value]
-            )
+            groups.append([value])
 
     return [
-        int(
-            round(
-                np.mean(group)
-            )
-        )
-        for group in groups
+        int(np.mean(x))
+        for x in groups
     ]
 
 
-def detect_lines(gray):
+def detect_grid(img, gray):
     binary = cv2.adaptiveThreshold(
         gray,
         255,
@@ -509,1567 +445,541 @@ def detect_lines(gray):
         13,
     )
 
+    # Ruling lines on scanned attendance sheets are often thin red
+    # ink, which loses most of its contrast once flattened to
+    # grayscale (and can vanish further after CLAHE). That was
+    # causing every other horizontal row line to go undetected,
+    # which in turn made student_rows() merge two real rows into
+    # one oversized crop -> garbled, "two names smashed together"
+    # OCR output. Build a second mask straight from the color image
+    # that specifically picks up reddish pixels, and OR it into the
+    # structural mask so faint red lines still count.
+    r, g, b = cv2.split(img.astype(np.int16))
+
+    red_mask = (
+        (r - np.maximum(g, b)) > 20
+    ).astype(np.uint8) * 255
+
+    binary = cv2.bitwise_or(binary, red_mask)
+
     h, w = gray.shape
 
-    # Horizontal
-    h_kernel = cv2.getStructuringElement(
+    hk = cv2.getStructuringElement(
         cv2.MORPH_RECT,
-        (
-            max(20, w // 40),
-            1,
-        ),
+        (max(20, w // 40), 1),
+    )
+
+    vk = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, max(20, h // 40)),
     )
 
     horizontal = cv2.morphologyEx(
         binary,
         cv2.MORPH_OPEN,
-        h_kernel,
-    )
-
-    # Vertical
-    v_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (
-            1,
-            max(20, h // 40),
-        ),
+        hk,
     )
 
     vertical = cv2.morphologyEx(
         binary,
         cv2.MORPH_OPEN,
-        v_kernel,
+        vk,
     )
 
-    h_proj = np.sum(
-        horizontal > 0,
-        axis=1,
+    hp = np.sum(horizontal > 0, axis=1)
+    vp = np.sum(vertical > 0, axis=0)
+
+    ys = group(
+        np.where(hp > w * 0.12)[0].tolist()
     )
 
-    v_proj = np.sum(
-        vertical > 0,
-        axis=0,
+    xs = group(
+        np.where(vp > h * 0.12)[0].tolist()
     )
 
-    y_threshold = max(
-        25,
-        int(
-            w
-            * MIN_LINE_LENGTH_RATIO
-        ),
-    )
-
-    x_threshold = max(
-        25,
-        int(
-            h
-            * MIN_LINE_LENGTH_RATIO
-        ),
-    )
-
-    y_candidates = np.where(
-        h_proj > y_threshold
-    )[0].tolist()
-
-    x_candidates = np.where(
-        v_proj > x_threshold
-    )[0].tolist()
-
-    ys = group_positions(
-        y_candidates,
-        tolerance=4,
-    )
-
-    xs = group_positions(
-        x_candidates,
-        tolerance=4,
-    )
-
-    return (
-        xs,
-        ys,
-        horizontal,
-        vertical,
-        binary,
-    )
+    return xs, ys
 
 
 # ============================================================
-# OCR HELPERS
+# ATTENDANCE STRUCTURE
 # ============================================================
 
-def word_center(box):
-    x1, y1, x2, y2 = box
+def find_day_columns(xs):
+    """
+    Find the longest sequence of narrow,
+    approximately equal-width columns.
+    """
 
-    return (
-        (x1 + x2) / 2,
-        (y1 + y2) / 2,
-    )
-
-
-def find_text_candidates(
-    words,
-    keyword,
-):
-    keyword = keyword.lower()
-
-    matches = []
-
-    for word in words:
-        text = (
-            word["text"]
-            .lower()
-            .strip()
-        )
-
-        if keyword in text:
-            matches.append(
-                word
-            )
-
-    return matches
-
-
-# ============================================================
-# ATTENDANCE TABLE REGION
-# ============================================================
-
-def detect_attendance_anchor(
-    words,
-    image_height,
-):
-    keywords = [
-        "student full name",
-        "student name",
-        "sex",
-        "total absent",
-        "absent days",
-    ]
-
-    y_values = []
-
-    for keyword in keywords:
-        matches = find_text_candidates(
-            words,
-            keyword,
-        )
-
-        for match in matches:
-            _, cy = word_center(
-                match["box"]
-            )
-
-            y_values.append(
-                cy
-            )
-
-    if y_values:
-        return int(
-            np.median(y_values)
-        )
-
-    return int(
-        image_height * 0.45
-    )
-
-
-def estimate_attendance_region(
-    image,
-    words,
-    xs,
-    ys,
-):
-    h, w = image.shape[:2]
-
-    anchor_y = detect_attendance_anchor(
-        words,
-        h,
-    )
-
-    nearby_top = [
-        y
-        for y in ys
-        if (
-            anchor_y - 100
-            <= y
-            <= anchor_y + 60
-        )
-    ]
-
-    if nearby_top:
-        table_top = min(
-            nearby_top
-        )
-    else:
-        table_top = int(
-            h * 0.45
-        )
-
-    lower_lines = [
-        y
-        for y in ys
-        if y > table_top
-    ]
-
-    if lower_lines:
-        table_bottom = min(
-            int(h * 0.93),
-            max(lower_lines),
-        )
-    else:
-        table_bottom = int(
-            h * 0.9
-        )
-
-    valid_x = [
-        x
-        for x in xs
-        if (
-            w * 0.005
-            < x
-            < w * 0.995
-        )
-    ]
-
-    if len(valid_x) >= 2:
-        table_left = min(
-            valid_x
-        )
-        table_right = max(
-            valid_x
-        )
-    else:
-        table_left = int(
-            w * 0.01
-        )
-        table_right = int(
-            w * 0.99
-        )
-
-    return (
-        table_left,
-        table_top,
-        table_right,
-        table_bottom,
-    )
-
-
-# ============================================================
-# FILTER TABLE LINES
-# ============================================================
-
-def line_strength_vertical(
-    vertical_mask,
-    x,
-    y1,
-    y2,
-):
-    h, w = vertical_mask.shape
-
-    crop = vertical_mask[
-        max(0, y1):
-        min(h, y2),
-        max(0, x - 2):
-        min(w, x + 3),
-    ]
-
-    if crop.size == 0:
-        return 0
-
-    return float(
-        np.mean(crop > 0)
-    )
-
-
-def line_strength_horizontal(
-    horizontal_mask,
-    y,
-    x1,
-    x2,
-):
-    h, w = horizontal_mask.shape
-
-    crop = horizontal_mask[
-        max(0, y - 2):
-        min(h, y + 3),
-        max(0, x1):
-        min(w, x2),
-    ]
-
-    if crop.size == 0:
-        return 0
-
-    return float(
-        np.mean(crop > 0)
-    )
-
-
-def detect_table_verticals(
-    xs,
-    vertical_mask,
-    table_top,
-    table_bottom,
-):
-    result = []
-
-    for x in xs:
-        strength = (
-            line_strength_vertical(
-                vertical_mask,
-                x,
-                table_top,
-                table_bottom,
-            )
-        )
-
-        if strength > 0.18:
-            result.append(x)
-
-    return group_positions(
-        result,
-        tolerance=5,
-    )
-
-
-def detect_table_horizontals(
-    ys,
-    horizontal_mask,
-    table_left,
-    table_right,
-    table_top,
-    table_bottom,
-):
-    result = []
-
-    for y in ys:
-        if not (
-            table_top - 10
-            <= y
-            <= table_bottom + 10
-        ):
-            continue
-
-        strength = (
-            line_strength_horizontal(
-                horizontal_mask,
-                y,
-                table_left,
-                table_right,
-            )
-        )
-
-        if strength > 0.18:
-            result.append(y)
-
-    return group_positions(
-        result,
-        tolerance=5,
-    )
-
-
-# ============================================================
-# DETECT 1-31 DAY COLUMNS
-# ============================================================
-
-def infer_attendance_columns(
-    verticals,
-):
-    if len(verticals) < 15:
+    if len(xs) < 15:
         return None
 
-    gaps = np.diff(
-        verticals
-    )
+    gaps = np.diff(xs)
 
-    positive_gaps = [
-        g
-        for g in gaps
+    small = sorted(
+        g for g in gaps
         if g > 3
-    ]
+    )
 
-    if not positive_gaps:
+    if not small:
         return None
 
-    sorted_gaps = sorted(
-        positive_gaps
+    width = np.median(
+        small[:max(5, len(small) // 2)]
     )
 
-    take = max(
-        5,
-        len(sorted_gaps) // 2,
-    )
+    runs = []
 
-    day_width = float(
-        np.median(
-            sorted_gaps[:take]
-        )
-    )
+    for start in range(len(xs) - 1):
 
-    candidates = []
+        run = [xs[start]]
 
-    for start in range(
-        len(verticals) - 10
-    ):
-        run = [
-            verticals[start]
-        ]
+        for i in range(start, len(xs) - 1):
 
-        for j in range(
-            start,
-            len(verticals) - 1
-        ):
-            gap = (
-                verticals[j + 1]
-                - verticals[j]
-            )
+            gap = xs[i + 1] - xs[i]
 
-            if (
-                day_width * 0.5
-                <= gap
-                <= day_width * 1.75
-            ):
-                run.append(
-                    verticals[j + 1]
-                )
+            if width * 0.5 <= gap <= width * 1.7:
+                run.append(xs[i + 1])
+
             else:
                 break
 
         if len(run) >= 15:
-            candidates.append(
-                run
-            )
+            runs.append(run)
 
-    if not candidates:
+    if not runs:
         return None
 
-    day_lines = max(
-        candidates,
-        key=len,
-    )
+    days = max(runs, key=len)
 
-    if len(day_lines) >= 32:
-        day_lines = (
-            day_lines[:32]
-        )
-
-    day_start_index = (
-        verticals.index(
-            day_lines[0]
-        )
-    )
-
-    if day_start_index < 3:
-        return None
-
-    sex_left = (
-        verticals[
-            day_start_index - 1
-        ]
-    )
-
-    name_left = (
-        verticals[
-            day_start_index - 2
-        ]
-    )
-
-    serial_left = (
-        verticals[
-            day_start_index - 3
-        ]
-    )
-
-    if day_start_index >= 4:
-        no_left = (
-            verticals[
-                day_start_index - 4
-            ]
-        )
-    else:
-        no_left = (
-            verticals[0]
-        )
-
-    return {
-        "day_lines": day_lines,
-        "day_start_index":
-            day_start_index,
-        "no_left":
-            no_left,
-        "serial_left":
-            serial_left,
-        "name_left":
-            name_left,
-        "sex_left":
-            sex_left,
-        "day_left":
-            day_lines[0],
-        "day_right":
-            day_lines[-1],
-    }
+    # Attendance has 31 days = 32 boundaries
+    return days[:32]
 
 
-# ============================================================
-# STUDENT ROW DETECTION
-# ============================================================
+def recover_missing_lines(ys, min_gap=8):
+    """
+    Safety net for row lines detect_grid() still missed (e.g. an
+    especially faint or broken rule line). If a gap between two
+    detected lines is close to an integer multiple of the smallest
+    plausible row height, it's almost certainly hiding one or more
+    undetected lines in between — insert synthetic split points at
+    even spacing so downstream cropping doesn't grab two students'
+    rows as one (the cause of merged/garbled OCR text).
+    """
 
-def identify_student_rows(
-    horizontal_lines,
-):
-    if len(
-        horizontal_lines
-    ) < 3:
-        return []
+    ys = sorted(set(int(y) for y in ys))
 
-    gaps = np.diff(
-        horizontal_lines
-    )
+    if len(ys) < 3:
+        return ys
 
-    good_gaps = [
-        gap
-        for gap in gaps
-        if 8 <= gap <= 120
-    ]
+    gaps = np.diff(ys)
 
-    if not good_gaps:
-        return []
+    plausible = gaps[gaps > min_gap]
 
-    typical = float(
-        np.median(
-            good_gaps
-        )
-    )
+    if plausible.size == 0:
+        return ys
 
-    row_pairs = []
+    unit = float(np.min(plausible))
 
-    for i in range(
-        len(horizontal_lines) - 1
-    ):
-        y1 = horizontal_lines[i]
-        y2 = horizontal_lines[
-            i + 1
-        ]
+    if unit <= 0:
+        return ys
+
+    filled = [ys[0]]
+
+    for y1, y2 in zip(ys[:-1], ys[1:]):
 
         gap = y2 - y1
+        n = max(1, int(round(gap / unit)))
 
-        if (
-            typical * 0.50
-            <= gap
-            <= typical * 1.7
-        ):
-            row_pairs.append(
-                (y1, y2)
-            )
+        for k in range(1, n):
+            filled.append(int(round(y1 + k * gap / n)))
 
-    best_run = []
-    current = []
-    previous_y2 = None
+        filled.append(y2)
 
-    for pair in row_pairs:
-        y1, y2 = pair
-
-        if (
-            previous_y2 is None
-            or abs(
-                y1 - previous_y2
-            ) <= 8
-        ):
-            current.append(
-                pair
-            )
-        else:
-            if (
-                len(current)
-                > len(best_run)
-            ):
-                best_run = current
-
-            current = [
-                pair
-            ]
-
-        previous_y2 = y2
-
-    if (
-        len(current)
-        > len(best_run)
-    ):
-        best_run = current
-
-    return best_run
+    return sorted(set(filled))
 
 
-# ============================================================
-# CROP CELL
-# ============================================================
+def student_rows(ys):
+    if len(ys) < 3:
+        return []
 
-def crop_cell(
-    image,
-    x1,
-    y1,
-    x2,
-    y2,
-    pad=2,
-):
-    h, w = image.shape[:2]
+    gaps = np.diff(ys)
 
-    x1 = max(
-        0,
-        int(x1 + pad),
-    )
-
-    y1 = max(
-        0,
-        int(y1 + pad),
-    )
-
-    x2 = min(
-        w,
-        int(x2 - pad),
-    )
-
-    y2 = min(
-        h,
-        int(y2 - pad),
-    )
-
-    if (
-        x2 <= x1
-        or y2 <= y1
-    ):
-        return np.empty(
-            (0, 0),
-            dtype=np.uint8,
-        )
-
-    return image[
-        y1:y2,
-        x1:x2,
+    valid = [
+        g for g in gaps
+        if 10 <= g <= 100
     ]
 
+    if not valid:
+        return []
+
+    height = np.median(valid)
+
+    rows = []
+
+    for y1, y2 in zip(
+        ys[:-1],
+        ys[1:],
+    ):
+        if (
+            height * 0.55
+            <= y2 - y1
+            <= height * 1.6
+        ):
+            rows.append((y1, y2))
+
+    return rows
+
+
+def crop(img, x1, y1, x2, y2, pad=2):
+    h, w = img.shape[:2]
+
+    x1 = max(0, int(x1 + pad))
+    y1 = max(0, int(y1 + pad))
+
+    x2 = min(w, int(x2 - pad))
+    y2 = min(h, int(y2 - pad))
+
+    if x2 <= x1 or y2 <= y1:
+        return np.empty((0, 0), dtype=np.uint8)
+
+    return img[y1:y2, x1:x2]
+
 
 # ============================================================
-# ATTENDANCE MARK DETECTION
+# ATTENDANCE MARK
 # ============================================================
 
-def remove_grid_lines(
-    gray_crop,
-):
-    if gray_crop.size == 0:
-        return gray_crop
+def attendance_mark(cell):
+    """
+    We don't force OCR on tiny handwritten marks.
+
+    If meaningful ink exists -> •
+    If empty -> blank
+
+    User can then correct • into U/H/C/etc.
+    """
+
+    if cell is None or cell.size == 0:
+        return ""
+
+    gray = (
+        cv2.cvtColor(cell, cv2.COLOR_RGB2GRAY)
+        if cell.ndim == 3
+        else cell
+    )
 
     binary = cv2.threshold(
-        gray_crop,
+        gray,
         0,
         255,
-        cv2.THRESH_BINARY_INV
-        + cv2.THRESH_OTSU,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
     )[1]
 
     h, w = binary.shape
 
-    horizontal_kernel = (
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (
-                max(
-                    3,
-                    w // 2,
-                ),
-                1,
-            ),
-        )
-    )
+    # Ignore cell borders
+    mx = max(2, int(w * 0.18))
+    my = max(2, int(h * 0.18))
 
-    vertical_kernel = (
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (
-                1,
-                max(
-                    3,
-                    h // 2,
-                ),
-            ),
-        )
-    )
-
-    horizontal_lines = (
-        cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            horizontal_kernel,
-        )
-    )
-
-    vertical_lines = (
-        cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            vertical_kernel,
-        )
-    )
-
-    cleaned = cv2.subtract(
-        binary,
-        horizontal_lines,
-    )
-
-    cleaned = cv2.subtract(
-        cleaned,
-        vertical_lines,
-    )
-
-    return cleaned
-
-
-def has_attendance_ink(
-    image_crop,
-):
-    if image_crop.size == 0:
-        return False
-
-    if len(
-        image_crop.shape
-    ) == 3:
-        gray = cv2.cvtColor(
-            image_crop,
-            cv2.COLOR_RGB2GRAY,
-        )
-    else:
-        gray = image_crop
-
-    cleaned = remove_grid_lines(
-        gray
-    )
-
-    if cleaned.size == 0:
-        return False
-
-    h, w = cleaned.shape
-
-    mx = max(
-        1,
-        int(w * 0.10),
-    )
-
-    my = max(
-        1,
-        int(h * 0.10),
-    )
-
-    inner = cleaned[
-        my:
-        max(
-            my + 1,
-            h - my,
-        ),
-        mx:
-        max(
-            mx + 1,
-            w - mx,
-        ),
+    inner = binary[
+        my:max(my + 1, h - my),
+        mx:max(mx + 1, w - mx),
     ]
 
     if inner.size == 0:
-        return False
-
-    ink_ratio = float(
-        np.mean(
-            inner > 0
-        )
-    )
-
-    return (
-        ink_ratio
-        >= ATTENDANCE_MARK_BLACK_RATIO
-    )
-
-
-def read_attendance_mark(
-    ocr,
-    crop,
-):
-    if not has_attendance_ink(
-        crop
-    ):
         return ""
 
-    if len(
-        crop.shape
-    ) == 3:
-        gray = cv2.cvtColor(
-            crop,
-            cv2.COLOR_RGB2GRAY,
-        )
-    else:
-        gray = crop
+    ink = np.mean(inner > 0)
 
-    enlarged = cv2.resize(
-        gray,
-        None,
-        fx=5,
-        fy=5,
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    try:
-        text = ocr_crop(
-            ocr,
-            enlarged,
-            upscale=1.0,
-        )
-    except Exception:
-        text = ""
-
-    text = (
-        text
-        .strip()
-        .replace(" ", "")
-    )
-
-    # Only trust tiny OCR outputs
-    if (
-        text
-        and len(text) <= 3
-    ):
-        return text
-
-    # Preserve mark presence
-    return "•"
+    return "•" if ink > 0.015 else ""
 
 
 # ============================================================
-# ATTENDANCE EXTRACTION
+# EXTRACT ATTENDANCE
 # ============================================================
 
-def extract_attendance_sheet(
-    image,
-    ocr,
-):
-    processed, gray = (
-        preprocess(image)
-    )
+def extract_attendance(img, model, status=None):
+    img, gray = preprocess(img)
 
-    (
-        xs,
-        ys,
-        horizontal_mask,
-        vertical_mask,
-        binary,
-    ) = detect_lines(
-        gray
-    )
+    xs, ys = detect_grid(img, gray)
+    ys = recover_missing_lines(ys)
 
-    raw_words = run_ocr(
-        ocr,
-        processed,
-    )
+    days = find_day_columns(xs)
 
-    (
-        table_left,
-        table_top,
-        table_right,
-        table_bottom,
-    ) = estimate_attendance_region(
-        processed,
-        raw_words,
-        xs,
-        ys,
-    )
-
-    verticals = (
-        detect_table_verticals(
-            xs,
-            vertical_mask,
-            table_top,
-            table_bottom,
-        )
-    )
-
-    horizontals = (
-        detect_table_horizontals(
-            ys,
-            horizontal_mask,
-            table_left,
-            table_right,
-            table_top,
-            table_bottom,
-        )
-    )
-
-    columns = (
-        infer_attendance_columns(
-            verticals
-        )
-    )
-
-    if not columns:
-        raise RuntimeError(
-            "Could not detect the 1–31 attendance columns."
+    if days is None or len(days) < 10:
+        raise ValueError(
+            "Could not detect attendance day columns."
         )
 
-    student_rows = (
-        identify_student_rows(
-            horizontals
+    start = xs.index(days[0])
+
+    if start < 3:
+        raise ValueError(
+            "Could not locate Name/Sex columns."
         )
+
+    # Columns immediately before day 1
+    sex_x = xs[start - 1]
+    name_x = xs[start - 2]
+    serial_x = xs[start - 3]
+
+    no_x = (
+        xs[start - 4]
+        if start >= 4
+        else xs[0]
     )
 
-    if not student_rows:
-        raise RuntimeError(
+    rows = student_rows(ys)
+
+    if not rows:
+        raise ValueError(
             "Could not detect student rows."
         )
 
-    day_lines = (
-        columns["day_lines"]
-    )
+    # --------------------------------------------------------
+    # Crop every text field for every row FIRST, then run OCR
+    # once on the whole batch. This replaces calling the full
+    # detect+recognize pipeline separately for every single cell
+    # (rows * 4 model calls), which is what was making the app sit
+    # at "Processing page 1..." for a long time on CPU with no
+    # visible progress.
+    # --------------------------------------------------------
 
-    day_count = (
-        len(day_lines) - 1
-    )
+    if status is not None:
+        status.write(f"Detected {len(rows)} student row(s). Cropping fields...")
 
-    filtered_rows = []
+    crops = []
+    field_of = []  # (row_index, field_name), same order as `crops`
 
-    for y1, y2 in student_rows:
-        name_crop = crop_cell(
-            processed,
-            columns["name_left"],
-            y1,
-            columns["sex_left"],
-            y2,
-            pad=3,
-        )
+    for i, (y1, y2) in enumerate(rows):
 
-        name = ocr_crop(
-            ocr,
-            name_crop,
-            upscale=3,
-        )
+        crops.append(crop(img, name_x, y1, sex_x, y2, 3))
+        field_of.append((i, "name"))
 
-        lower_name = (
-            name.lower()
-        )
+        crops.append(crop(img, no_x, y1, serial_x, y2, 3))
+        field_of.append((i, "no"))
 
-        if (
-            "student"
-            in lower_name
-            or "full name"
-            in lower_name
-            or "first name"
-            in lower_name
-        ):
-            continue
+        crops.append(crop(img, serial_x, y1, name_x, y2, 3))
+        field_of.append((i, "serial"))
 
-        filtered_rows.append(
-            (
-                y1,
-                y2,
-                name,
-            )
-        )
+        crops.append(crop(img, sex_x, y1, days[0], y2, 2))
+        field_of.append((i, "sex"))
 
-    student_rows = (
-        filtered_rows
-    )
+    if status is not None:
+        status.write(f"Recognizing text in {len(crops)} cell(s) (single batched pass)...")
+
+    texts = reco_batch(model, crops)
+
+    fields = [{} for _ in rows]
+
+    for (row_i, field_name), text in zip(field_of, texts):
+        fields[row_i][field_name] = text
+
+    if status is not None:
+        status.write("Building table and reading attendance marks...")
 
     records = []
+    
+    # Debug: track which rows are being filtered
+    debug_info = []
 
-    for row_index, (
-        y1,
-        y2,
-        preliminary_name,
-    ) in enumerate(
-        student_rows,
-        start=1,
-    ):
+    for i, (y1, y2) in enumerate(rows):
 
-        # No
-        no_crop = crop_cell(
-            processed,
-            columns["no_left"],
-            y1,
-            columns["serial_left"],
-            y2,
-            pad=3,
-        )
+        name = fields[i].get("name", "")
 
-        no_text = ocr_crop(
-            ocr,
-            no_crop,
-            upscale=3,
-        )
+        # Skip header
+        lower = name.lower()
 
-        # Serial
-        serial_crop = crop_cell(
-            processed,
-            columns["serial_left"],
-            y1,
-            columns["name_left"],
-            y2,
-            pad=3,
-        )
+        if (
+            "student" in lower
+            or "full name" in lower
+        ):
+            debug_info.append(f"Row {i}: Skipped (header row)")
+            continue
 
-        serial_text = ocr_crop(
-            ocr,
-            serial_crop,
-            upscale=3,
-        )
+        no = fields[i].get("no", "")
+        serial = fields[i].get("serial", "")
+        sex = fields[i].get("sex", "")
 
-        # Name
-        name_crop = crop_cell(
-            processed,
-            columns["name_left"],
-            y1,
-            columns["sex_left"],
-            y2,
-            pad=3,
-        )
+        # Ignore completely empty non-student rows - but be lenient
+        # If we have SOME content (name OR serial), include it
+        if not name and not serial and not no:
+            debug_info.append(f"Row {i}: Skipped (all fields empty)")
+            continue
 
-        name = (
-            preliminary_name
-            or ocr_crop(
-                ocr,
-                name_crop,
-                upscale=3,
-            )
-        )
+        debug_info.append(f"Row {i}: Included (name='{name}', serial='{serial}', no='{no}')")
 
-        # Sex
-        sex_crop = crop_cell(
-            processed,
-            columns["sex_left"],
-            y1,
-            columns["day_left"],
-            y2,
-            pad=2,
-        )
-
-        sex = ocr_crop(
-            ocr,
-            sex_crop,
-            upscale=4,
-        )
-
-        sex = (
-            sex.strip()
-            .upper()
-        )
-
-        if len(sex) > 3:
-            if "F" in sex:
-                sex = "F"
-            elif "M" in sex:
-                sex = "M"
-            else:
-                sex = sex[:3]
-
-        record = {
-            "No": (
-                no_text
-                if no_text
-                else str(row_index)
-            ),
-            "Serial No":
-                serial_text,
-            "Student Full Name":
-                name,
-            "Sex":
-                sex,
+        row = {
+            "No": no or str(len(records) + 1),
+            "Serial No": serial,
+            "Student Full Name": name,
+            "Sex": sex,
         }
 
-        for day_index in range(
-            day_count
-        ):
-            x1 = (
-                day_lines[
-                    day_index
-                ]
+        for j in range(len(days) - 1):
+
+            cell = crop(
+                img,
+                days[j],
+                y1,
+                days[j + 1],
+                y2,
+                1,
             )
 
-            x2 = (
-                day_lines[
-                    day_index + 1
-                ]
+            row[str(j + 1)] = attendance_mark(cell)
+
+        records.append(row)
+
+    if not records:
+        debug_msg = "\n".join(debug_info) if debug_info else "No rows processed"
+        # Fallback: create empty rows for each detected row so user can manually fill in
+        if len(rows) > 1:  # At least one real row (header might be included)
+            # Create empty records for each detected row, skipping the first one (usually header)
+            start_idx = 1 if len(rows) > 2 else 0  # Skip first row if it's likely a header
+            for i, (y1, y2) in enumerate(rows[start_idx:], start=start_idx):
+                row = {
+                    "No": str(i),
+                    "Serial No": "",
+                    "Student Full Name": "",
+                    "Sex": "",
+                }
+                for j in range(len(days) - 1):
+                    cell = crop(
+                        img,
+                        days[j],
+                        y1,
+                        days[j + 1],
+                        y2,
+                        1,
+                    )
+                    row[str(j + 1)] = attendance_mark(cell)
+                records.append(row)
+            # Return the records without the student info - user can fill it in manually
+            # The warning will be handled by the calling code
+        else:
+            raise ValueError(
+                f"Grid found, but no student rows were extracted.\n\nDEBUG INFO:\n{debug_msg}\n\nPlease check that:\n1. The PDF contains a table with student data\n2. The Name and Serial No columns are present\n3. Student rows are visible in the document"
             )
 
-            attendance_crop = (
-                crop_cell(
-                    processed,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    pad=1,
-                )
-            )
+    df = pd.DataFrame(records)
 
-            mark = (
-                read_attendance_mark(
-                    ocr,
-                    attendance_crop,
-                )
-            )
+    # Always create all 31 dates
+    for day in range(1, 32):
+        if str(day) not in df:
+            df[str(day)] = ""
 
-            record[
-                str(
-                    day_index + 1
-                )
-            ] = mark
-
-        records.append(
-            record
-        )
-
-    df = pd.DataFrame(
-        records
-    )
-
-    # Make sure 1-31 exist
-    for day in range(
-        1,
-        32,
-    ):
-        column = str(day)
-
-        if column not in df.columns:
-            df[column] = ""
-
-    expected_columns = (
+    columns = (
         [
             "No",
             "Serial No",
             "Student Full Name",
             "Sex",
         ]
-        + [
-            str(day)
-            for day
-            in range(
-                1,
-                32,
-            )
-        ]
+        + [str(x) for x in range(1, 32)]
     )
 
-    df = df[
-        expected_columns
-    ]
+    df = df[columns]
 
-    # Debug preview
-    preview = (
-        processed.copy()
-    )
+    # Debug image
+    preview = img.copy()
 
-    cv2.rectangle(
-        preview,
-        (
-            table_left,
-            table_top,
-        ),
-        (
-            table_right,
-            table_bottom,
-        ),
-        (
-            255,
-            0,
-            0,
-        ),
-        3,
-    )
-
-    for x in day_lines:
-        cv2.line(
-            preview,
-            (
-                x,
-                table_top,
-            ),
-            (
-                x,
-                table_bottom,
-            ),
-            (
-                0,
-                255,
-                0,
-            ),
-            1,
-        )
-
-    for (
-        y1,
-        y2,
-        *_,
-    ) in student_rows:
-        cv2.line(
-            preview,
-            (
-                table_left,
-                y1,
-            ),
-            (
-                table_right,
-                y1,
-            ),
-            (
-                255,
-                255,
-                0,
-            ),
-            1,
-        )
-
-    return {
-        "dataframe":
-            df,
-        "raw_words":
-            raw_words,
-        "preview":
-            preview,
-        "day_count":
-            day_count,
-        "verticals":
-            verticals,
-        "horizontals":
-            horizontals,
-    }
-
-
-# ============================================================
-# GENERIC GRID FALLBACK
-# ============================================================
-
-def find_interval(
-    value,
-    lines,
-):
-    for i in range(
-        len(lines) - 1
-    ):
-        if (
-            lines[i]
-            <= value
-            <= lines[i + 1]
-        ):
-            return i
-
-    return None
-
-
-def reconstruct_generic_grid(
-    image,
-    ocr,
-):
-    processed, gray = (
-        preprocess(image)
-    )
-
-    (
-        xs,
-        ys,
-        horizontal,
-        vertical,
-        binary,
-    ) = detect_lines(
-        gray
-    )
-
-    words = run_ocr(
-        ocr,
-        processed,
-    )
-
-    if (
-        len(xs) < 2
-        or len(ys) < 2
-    ):
-        raise RuntimeError(
-            "No usable grid detected."
-        )
-
-    rows = len(ys) - 1
-    cols = len(xs) - 1
-
-    cells = {
-        (r, c): []
-        for r in range(rows)
-        for c in range(cols)
-    }
-
-    for word in words:
-        cx, cy = (
-            word_center(
-                word["box"]
-            )
-        )
-
-        row = find_interval(
-            cy,
-            ys,
-        )
-
-        col = find_interval(
-            cx,
-            xs,
-        )
-
-        if (
-            row is not None
-            and col is not None
-        ):
-            cells[
-                (
-                    row,
-                    col,
-                )
-            ].append(
-                word
-            )
-
-    data = []
-
-    for r in range(rows):
-        row_data = []
-
-        for c in range(cols):
-            items = sorted(
-                cells[
-                    (
-                        r,
-                        c,
-                    )
-                ],
-                key=lambda x: (
-                    x["box"][1],
-                    x["box"][0],
-                ),
-            )
-
-            text = " ".join(
-                item["text"]
-                for item in items
-            )
-
-            row_data.append(
-                text
-            )
-
-        data.append(
-            row_data
-        )
-
-    df = pd.DataFrame(
-        data
-    )
-
-    df = (
-        df.replace(
-            r"^\s*$",
-            np.nan,
-            regex=True,
-        )
-        .dropna(
-            axis=0,
-            how="all",
-        )
-        .dropna(
-            axis=1,
-            how="all",
-        )
-        .fillna("")
-        .reset_index(
-            drop=True
-        )
-    )
-
-    preview = (
-        processed.copy()
-    )
-
-    for x in xs:
+    for x in days:
         cv2.line(
             preview,
             (x, 0),
-            (
-                x,
-                preview.shape[0],
-            ),
-            (
-                0,
-                255,
-                0,
-            ),
-            1,
+            (x, preview.shape[0]),
+            (0, 255, 0),
+            2,
         )
 
-    for y in ys:
+    for y1, y2 in rows:
         cv2.line(
             preview,
-            (0, y),
-            (
-                preview.shape[1],
-                y,
-            ),
-            (
-                255,
-                0,
-                0,
-            ),
+            (0, y1),
+            (preview.shape[1], y1),
+            (255, 0, 0),
             1,
         )
 
-    return {
-        "dataframe":
-            df,
-        "raw_words":
-            words,
-        "preview":
-            preview,
-    }
+    return df, preview
 
 
 # ============================================================
 # OLLAMA
 # ============================================================
 
-def ollama_json(
-    prompt,
-    model,
-    timeout=1800,
-):
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role":
-                        "system",
-                    "content": (
-                        "You classify OCR documents. "
-                        "Never invent values. "
-                        "Return valid JSON only."
-                    ),
-                },
-                {
-                    "role":
-                        "user",
-                    "content":
-                        prompt,
-                },
-            ],
-            "stream":
-                False,
-            "format":
-                "json",
-            "options": {
-                "temperature": 0,
-            },
-        },
-        timeout=timeout,
-    )
+def ollama_cleanup(df, model_name):
+    """
+    Ollama only examines headers/document structure.
+    It does NOT change attendance values.
+    """
 
-    response.raise_for_status()
-
-    content = (
-        response
-        .json()
-        .get(
-            "message",
-            {},
-        )
-        .get(
-            "content",
-            "",
-        )
-    )
-
-    return json.loads(
-        content
-    )
-
-
-def detect_document_type(
-    words,
-    model,
-):
-    text = " ".join(
-        item["text"]
-        for item
-        in words[:300]
-    )
+    preview = df.head(10).to_dict("records")
 
     prompt = f"""
-Classify this scanned document.
+This is an OCR extracted attendance sheet.
 
-Possible types:
-- attendance_sheet
-- financial_ledger
-- inventory
-- timesheet
-- register
-- generic_table
-
-OCR TEXT:
-{text}
+Data:
+{json.dumps(preview, ensure_ascii=False)}
 
 Return JSON:
 
 {{
-    "document_type": "attendance_sheet",
-    "confidence": 0.95
+ "document_type":"attendance_sheet",
+ "notes":"short description"
 }}
+
+Do not rewrite names, dates, IDs or attendance values.
 """
 
     try:
-        return ollama_json(
-            prompt,
-            model,
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                "format": "json",
+                "stream": False,
+                "options": {
+                    "temperature": 0
+                },
+            },
+            timeout=1800,
         )
-    except Exception:
-        lower = text.lower()
 
-        if (
-            "attendance"
-            in lower
-            or "absent"
-            in lower
-            or "student full name"
-            in lower
-        ):
-            return {
-                "document_type":
-                    "attendance_sheet",
-                "confidence":
-                    0.75,
-            }
+        r.raise_for_status()
 
+        return json.loads(
+            r.json()["message"]["content"]
+        )
+
+    except Exception as e:
         return {
-            "document_type":
-                "generic_table",
-            "confidence":
-                0.2,
+            "document_type": "attendance_sheet",
+            "notes": f"Ollama unavailable: {e}",
         }
 
 
 # ============================================================
-# EXCEL EXPORT
+# EXCEL
 # ============================================================
 
-def export_excel(df):
-    output = io.BytesIO()
+def make_excel(df):
+    out = io.BytesIO()
 
     wb = Workbook()
-
     ws = wb.active
-    ws.title = (
-        "Attendance"
-    )
+    ws.title = "Attendance"
 
     thin = Side(
         style="thin",
-        color="999999",
+        color="888888",
     )
 
     border = Border(
@@ -2079,377 +989,205 @@ def export_excel(df):
         bottom=thin,
     )
 
-    header_fill = (
-        PatternFill(
-            "solid",
-            fgColor="D9EAF7",
-        )
+    fill = PatternFill(
+        "solid",
+        fgColor="DDEBF7",
     )
 
-    for col_index, column in enumerate(
-        df.columns,
-        start=1,
-    ):
+    for c, column in enumerate(df.columns, 1):
+
         cell = ws.cell(
-            row=1,
-            column=col_index,
-            value=str(column),
+            1,
+            c,
+            str(column),
         )
 
-        cell.font = Font(
-            bold=True
+        cell.font = Font(bold=True)
+        cell.fill = fill
+        cell.border = border
+        cell.alignment = Alignment(
+            horizontal="center"
         )
 
-        cell.fill = (
-            header_fill
-        )
-
-        cell.border = (
-            border
-        )
-
-        cell.alignment = (
-            Alignment(
-                horizontal=
-                    "center",
-                vertical=
-                    "center",
-                wrap_text=True,
-            )
-        )
-
-    for row_index, row in enumerate(
-        df.itertuples(
-            index=False
-        ),
-        start=2,
+    for r, row in enumerate(
+        df.itertuples(index=False),
+        2,
     ):
-        for col_index, value in enumerate(
-            row,
-            start=1,
-        ):
+
+        for c, value in enumerate(row, 1):
+
             cell = ws.cell(
-                row=row_index,
-                column=col_index,
-                value=str(value),
+                r,
+                c,
+                str(value),
             )
 
-            cell.border = (
-                border
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="center"
             )
 
-            cell.alignment = (
-                Alignment(
-                    horizontal=
-                        "center",
-                    vertical=
-                        "center",
-                    wrap_text=True,
-                )
-            )
+    for i, column in enumerate(df.columns, 1):
 
-    for index, column in enumerate(
-        df.columns,
-        start=1,
-    ):
-        name = str(
-            column
-        )
-
-        if (
-            "Student Full Name"
-            in name
-        ):
+        if column == "Student Full Name":
             width = 30
-        elif (
-            name
-            == "Serial No"
-        ):
-            width = 15
-        elif (
-            name
-            == "No"
-        ):
-            width = 6
-        elif (
-            name
-            == "Sex"
-        ):
-            width = 7
-        elif name.isdigit():
+
+        elif str(column).isdigit():
             width = 5
+
         else:
             width = 12
 
         ws.column_dimensions[
-            get_column_letter(
-                index
-            )
+            get_column_letter(i)
         ].width = width
 
-    ws.freeze_panes = (
-        "A2"
-    )
+    ws.freeze_panes = "A2"
 
-    wb.save(
-        output
-    )
+    wb.save(out)
 
-    output.seek(0)
-
-    return output.getvalue()
+    return out.getvalue()
 
 
 # ============================================================
-# FULL ATTENDANCE PDF
+# PDF
 # ============================================================
 
-def export_attendance_pdf(
+def make_pdf(
     df,
-    title="ABSENCE RECORDING SHEET",
-    school_name="",
-    grade="",
-    class_name="",
-    zone="",
-    district="",
-    year="",
-    teacher_name="",
-    month="",
-    working_days="",
+    title,
+    school,
+    grade,
+    class_name,
+    teacher,
+    month,
+    year,
 ):
-    output = io.BytesIO()
+    """
+    Recreates attendance as a printable
+    A3 landscape PDF with all 31 days.
+    """
 
-    page_size = (
-        landscape(A3)
-    )
+    out = io.BytesIO()
 
     doc = SimpleDocTemplate(
-        output,
-        pagesize=page_size,
+        out,
+        pagesize=landscape(A3),
         leftMargin=5 * mm,
         rightMargin=5 * mm,
         topMargin=5 * mm,
         bottomMargin=5 * mm,
     )
 
-    styles = (
-        getSampleStyleSheet()
-    )
+    styles = getSampleStyleSheet()
 
-    story = []
-
-    # --------------------------------------------------------
-    # Title
-    # --------------------------------------------------------
-
-    title_style = (
-        styles["Heading1"]
-    )
-
-    title_style.alignment = 1
-    title_style.fontSize = 14
-    title_style.leading = 16
-
-    story.append(
+    story = [
         Paragraph(
             title,
-            title_style,
-        )
-    )
-
-    story.append(
-        Spacer(
-            1,
-            2 * mm,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Instructions
-    # --------------------------------------------------------
-
-    instruction_text = (
-        "Use for each month of the Academic Year. "
-        "Mark attendance daily during school days. "
-        "Use the appropriate absence code where relevant."
-    )
-
-    story.append(
-        Paragraph(
-            instruction_text,
-            styles["Normal"],
-        )
-    )
-
-    story.append(
-        Spacer(
-            1,
-            2 * mm,
-        )
-    )
+            styles["Title"],
+        ),
+        Spacer(1, 2 * mm),
+    ]
 
     # --------------------------------------------------------
     # Metadata
     # --------------------------------------------------------
 
-    metadata = [
+    meta = [
         [
-            f"School Name: {school_name}",
-            f"Zone: {zone}",
-            f"Teacher's Name: {teacher_name}",
-        ],
-        [
+            f"School: {school}",
             f"Grade: {grade}",
-            f"District: {district}",
-            f"Month: {month}",
+            f"Class: {class_name}",
         ],
         [
-            f"Class: {class_name}",
+            f"Teacher: {teacher}",
+            f"Month: {month}",
             f"Year: {year}",
-            f"No. of working days: {working_days}",
         ],
     ]
 
-    metadata_table = (
-        Table(
-            metadata,
-            colWidths=[
-                125 * mm,
-                105 * mm,
-                150 * mm,
-            ],
-        )
+    mt = Table(
+        meta,
+        colWidths=[
+            125 * mm,
+            125 * mm,
+            125 * mm,
+        ],
     )
 
-    metadata_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "GRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.5,
-                    colors.black,
-                ),
-                (
-                    "FONTNAME",
-                    (0, 0),
-                    (-1, -1),
-                    "Helvetica",
-                ),
-                (
-                    "FONTSIZE",
-                    (0, 0),
-                    (-1, -1),
-                    8,
-                ),
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "MIDDLE",
-                ),
-                (
-                    "LEFTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    4,
-                ),
-                (
-                    "RIGHTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    4,
-                ),
-                (
-                    "TOPPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    3,
-                ),
-                (
-                    "BOTTOMPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    3,
-                ),
-            ]
-        )
+    mt.setStyle(
+        TableStyle([
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.black,
+            ),
+            (
+                "FONTSIZE",
+                (0, 0),
+                (-1, -1),
+                8,
+            ),
+            (
+                "VALIGN",
+                (0, 0),
+                (-1, -1),
+                "MIDDLE",
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                4,
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                4,
+            ),
+        ])
     )
 
-    story.append(
-        metadata_table
-    )
-
-    story.append(
-        Spacer(
-            1,
-            2 * mm,
-        )
-    )
+    story += [
+        mt,
+        Spacer(1, 3 * mm),
+    ]
 
     # --------------------------------------------------------
-    # Ensure required columns
+    # Ensure columns
     # --------------------------------------------------------
 
-    temp_df = df.copy()
+    temp = df.copy()
 
-    required = [
+    for column in [
         "No",
         "Serial No",
         "Student Full Name",
         "Sex",
-    ]
+    ]:
+        if column not in temp:
+            temp[column] = ""
 
-    for column in required:
-        if column not in temp_df.columns:
-            temp_df[
-                column
-            ] = ""
-
-    for day in range(
-        1,
-        32,
-    ):
-        column = str(day)
-
-        if column not in temp_df.columns:
-            temp_df[
-                column
-            ] = ""
+    for day in range(1, 32):
+        if str(day) not in temp:
+            temp[str(day)] = ""
 
     # --------------------------------------------------------
-    # Total absent
+    # Absent totals
     # --------------------------------------------------------
 
-    def absent_total(
-        row,
-    ):
-        total = 0
+    def absent(row):
+        return sum(
+            str(row[str(day)]).strip().upper()
+            in {"A", "ABSENT"}
+            for day in range(1, 32)
+        )
 
-        for day in range(
-            1,
-            32,
-        ):
-            value = str(
-                row.get(
-                    str(day),
-                    "",
-                )
-            ).strip().upper()
-
-            if value in {
-                "A",
-                "ABSENT",
-            }:
-                total += 1
-
-        return total
-
-    temp_df[
-        "Total Absent Days"
-    ] = temp_df.apply(
-        absent_total,
+    temp["Total Absent Days"] = temp.apply(
+        absent,
         axis=1,
     )
 
@@ -2460,1071 +1198,549 @@ def export_attendance_pdf(
             "Student Full Name",
             "Sex",
         ]
-        + [
-            str(day)
-            for day
-            in range(
-                1,
-                32,
-            )
-        ]
-        + [
-            "Total Absent Days"
-        ]
+        + [str(x) for x in range(1, 32)]
+        + ["Total Absent Days"]
     )
 
-    temp_df = (
-        temp_df[
-            columns
-        ]
-    )
+    temp = temp[columns]
 
-    # --------------------------------------------------------
-    # Main table header
-    # --------------------------------------------------------
-
-    header = [
-        "No",
-        "Serial No\n(Same as in\nenrollment form)",
-        "Student Full Name\n(First Name, Father Name,\nGrandfather Name)",
-        "Sex\n(F/M)",
-    ]
-
-    header.extend(
+    header = (
         [
-            str(day)
-            for day
-            in range(
-                1,
-                32,
-            )
+            "No",
+            "Serial No",
+            "Student Full Name",
+            "Sex",
         ]
+        + [str(x) for x in range(1, 32)]
+        + ["Total\nAbsent"]
     )
 
-    header.append(
-        "Total\nAbsent\nDays"
-    )
+    data = [header]
 
-    table_data = [
-        header
-    ]
+    for _, row in temp.iterrows():
 
-    for _, row in (
-        temp_df.iterrows()
-    ):
-        table_data.append(
-            [
-                str(
-                    row[column]
-                )
-                if not pd.isna(
-                    row[column]
-                )
-                else ""
-                for column
-                in columns
-            ]
-        )
+        data.append([
+            "" if pd.isna(row[c])
+            else str(row[c])
+            for c in columns
+        ])
 
-    # --------------------------------------------------------
-    # Add blank printable rows
-    # --------------------------------------------------------
+    # Add printable blank rows
+    while len(data) < 21:
 
-    minimum_rows = 20
+        blank = [""] * len(columns)
 
-    while (
-        len(table_data) - 1
-        < minimum_rows
-    ):
-        row_number = (
-            len(table_data)
-        )
+        blank[0] = str(len(data))
 
-        blank = [
-            ""
-            for _
-            in columns
-        ]
+        data.append(blank)
 
-        blank[0] = str(
-            row_number
-        )
-
-        table_data.append(
-            blank
-        )
-
-    # --------------------------------------------------------
-    # Widths
-    # --------------------------------------------------------
-
-    column_widths = [
-        8 * mm,
-        23 * mm,
-        62 * mm,
-        10 * mm,
-    ]
-
-    column_widths.extend(
+    widths = (
         [
-            7.0 * mm
-            for _
-            in range(31)
+            8 * mm,
+            22 * mm,
+            60 * mm,
+            10 * mm,
         ]
+        + [7 * mm] * 31
+        + [16 * mm]
     )
 
-    column_widths.append(
-        17 * mm
-    )
-
-    # --------------------------------------------------------
-    # Main attendance table
-    # --------------------------------------------------------
-
-    attendance_table = Table(
-        table_data,
-        colWidths=column_widths,
+    table = Table(
+        data,
+        colWidths=widths,
         repeatRows=1,
-        rowHeights=[
-            14 * mm
-        ]
-        + [
-            7.4 * mm
-            for _
-            in range(
-                len(table_data)
-                - 1
-            )
-        ],
     )
 
-    attendance_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (-1, 0),
-                    colors.HexColor(
-                        "#E5E5E5"
-                    ),
-                ),
-                (
-                    "FONTNAME",
-                    (0, 0),
-                    (-1, 0),
-                    "Helvetica-Bold",
-                ),
-                (
-                    "FONTNAME",
-                    (0, 1),
-                    (-1, -1),
-                    "Helvetica",
-                ),
-                (
-                    "FONTSIZE",
-                    (0, 0),
-                    (-1, 0),
-                    5.2,
-                ),
-                (
-                    "FONTSIZE",
-                    (0, 1),
-                    (-1, -1),
-                    6,
-                ),
-                (
-                    "GRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.35,
-                    colors.black,
-                ),
-                (
-                    "ALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "CENTER",
-                ),
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "MIDDLE",
-                ),
-                (
-                    "ALIGN",
-                    (2, 1),
-                    (2, -1),
-                    "LEFT",
-                ),
-                (
-                    "LEFTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    1,
-                ),
-                (
-                    "RIGHTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    1,
-                ),
-                (
-                    "TOPPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    1,
-                ),
-                (
-                    "BOTTOMPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    1,
-                ),
-            ]
-        )
+    table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.lightgrey,
+            ),
+            (
+                "FONTNAME",
+                (0, 0),
+                (-1, 0),
+                "Helvetica-Bold",
+            ),
+            (
+                "FONTSIZE",
+                (0, 0),
+                (-1, -1),
+                5.5,
+            ),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.35,
+                colors.black,
+            ),
+            (
+                "ALIGN",
+                (0, 0),
+                (-1, -1),
+                "CENTER",
+            ),
+            (
+                "VALIGN",
+                (0, 0),
+                (-1, -1),
+                "MIDDLE",
+            ),
+            (
+                "ALIGN",
+                (2, 1),
+                (2, -1),
+                "LEFT",
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                2,
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                2,
+            ),
+        ])
     )
 
-    story.append(
-        attendance_table
-    )
+    story.append(table)
 
     # --------------------------------------------------------
-    # Daily absent totals
+    # Daily totals
     # --------------------------------------------------------
 
     totals = [
-        "Total Absent Students for the Day",
+        "Total Absent Students",
         "",
         "",
         "",
     ]
 
-    for day in range(
-        1,
-        32,
-    ):
-        column = str(day)
+    for day in range(1, 32):
 
-        count = 0
-
-        for value in (
-            temp_df[column]
-        ):
-            value = str(
-                value
-            ).strip().upper()
-
-            if value in {
-                "A",
-                "ABSENT",
-            }:
-                count += 1
+        count = sum(
+            str(x).strip().upper()
+            in {"A", "ABSENT"}
+            for x in temp[str(day)]
+        )
 
         totals.append(
-            str(count)
-            if count
-            else ""
+            str(count) if count else ""
         )
 
     totals.append("")
 
-    totals_table = Table(
-        [
-            totals
-        ],
-        colWidths=column_widths,
-        rowHeights=[
-            7 * mm
-        ],
+    total_table = Table(
+        [totals],
+        colWidths=widths,
     )
 
-    totals_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "SPAN",
-                    (0, 0),
-                    (3, 0),
-                ),
-                (
-                    "GRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.35,
-                    colors.black,
-                ),
-                (
-                    "FONTNAME",
-                    (0, 0),
-                    (-1, -1),
-                    "Helvetica-Bold",
-                ),
-                (
-                    "FONTSIZE",
-                    (0, 0),
-                    (-1, -1),
-                    5.5,
-                ),
-                (
-                    "ALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "CENTER",
-                ),
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "MIDDLE",
-                ),
-            ]
-        )
+    total_table.setStyle(
+        TableStyle([
+            (
+                "SPAN",
+                (0, 0),
+                (3, 0),
+            ),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.35,
+                colors.black,
+            ),
+            (
+                "FONTNAME",
+                (0, 0),
+                (-1, -1),
+                "Helvetica-Bold",
+            ),
+            (
+                "FONTSIZE",
+                (0, 0),
+                (-1, -1),
+                5.5,
+            ),
+            (
+                "ALIGN",
+                (0, 0),
+                (-1, -1),
+                "CENTER",
+            ),
+        ])
     )
 
-    story.append(
-        totals_table
-    )
-
-    story.append(
-        Spacer(
-            1,
-            2 * mm,
-        )
-    )
+    story += [
+        total_table,
+        Spacer(1, 3 * mm),
+    ]
 
     # --------------------------------------------------------
-    # Absence codes legend
+    # Legend
     # --------------------------------------------------------
 
     legend = [
         [
-            "Reason",
-            "CODE",
-            "Reason",
-            "CODE",
-            "Reason",
-            "CODE",
-            "Reason",
-            "CODE",
+            "Unknown Absence", "U",
+            "Illness", "H",
+            "Chores", "C",
+            "Not Interested", "NI",
         ],
         [
-            "Unknown Absence",
-            "U",
-            "Chores",
-            "C",
-            "Not Interested",
-            "NI",
-            "Local / Public Holiday",
-            "L",
-        ],
-        [
-            "Illness",
-            "H",
-            "No School Materials",
-            "NSM",
-            "Other",
-            "O",
-            "Weekend",
-            "X",
+            "No School Materials", "NSM",
+            "Other", "O",
+            "Holiday", "L",
+            "Weekend", "X",
         ],
     ]
 
-    legend_table = Table(
+    lt = Table(
         legend,
         colWidths=[
-            39 * mm,
+            40 * mm,
             12 * mm,
-            39 * mm,
-            12 * mm,
-            39 * mm,
-            12 * mm,
-            39 * mm,
-            12 * mm,
-        ],
+        ] * 4,
     )
 
-    legend_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (-1, 0),
-                    colors.HexColor(
-                        "#E5E5E5"
-                    ),
-                ),
-                (
-                    "GRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.35,
-                    colors.black,
-                ),
-                (
-                    "FONTNAME",
-                    (0, 0),
-                    (-1, 0),
-                    "Helvetica-Bold",
-                ),
-                (
-                    "FONTSIZE",
-                    (0, 0),
-                    (-1, -1),
-                    6,
-                ),
-                (
-                    "ALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "CENTER",
-                ),
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "MIDDLE",
-                ),
-            ]
-        )
+    lt.setStyle(
+        TableStyle([
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.35,
+                colors.black,
+            ),
+            (
+                "FONTSIZE",
+                (0, 0),
+                (-1, -1),
+                6,
+            ),
+            (
+                "ALIGN",
+                (1, 0),
+                (1, -1),
+                "CENTER",
+            ),
+            (
+                "ALIGN",
+                (3, 0),
+                (3, -1),
+                "CENTER",
+            ),
+            (
+                "ALIGN",
+                (5, 0),
+                (5, -1),
+                "CENTER",
+            ),
+            (
+                "ALIGN",
+                (7, 0),
+                (7, -1),
+                "CENTER",
+            ),
+        ])
     )
 
-    story.append(
-        legend_table
-    )
+    story.append(lt)
 
-    doc.build(
-        story
-    )
+    doc.build(story)
 
-    output.seek(0)
-
-    return output.getvalue()
+    return out.getvalue()
 
 
 # ============================================================
-# SIDEBAR
+# UI
 # ============================================================
 
 with st.sidebar:
-    st.header(
-        "Settings"
+
+    st.header("Settings")
+
+    language_label = st.selectbox(
+        "Handwriting / print language",
+        list(LANGUAGE_OPTIONS.keys()),
+        index=0,
     )
 
-    ollama_model = st.text_input(
+    ocr_lang = LANGUAGE_OPTIONS[language_label]
+
+    st.caption(
+        "Sets which PaddleOCR recognition model is loaded — pick the "
+        "language the sheet is actually written in, not the UI language."
+    )
+
+    model_name = st.text_input(
         "Ollama model",
-        value=DEFAULT_OLLAMA_MODEL,
-    )
-
-    force_attendance = st.checkbox(
-        "Force Attendance Mode",
-        value=True,
+        OLLAMA_MODEL,
     )
 
     use_ollama = st.checkbox(
-        "Use Ollama document classification",
-        value=True,
-    )
-
-    show_grid = st.checkbox(
-        "Show detected structure",
-        value=True,
-    )
-
-    st.info(
-        "For your current attendance sheets, "
-        "keep Force Attendance Mode enabled."
-    )
-
-
-# ============================================================
-# UPLOAD
-# ============================================================
-
-uploaded_file = (
-    st.file_uploader(
-        "Upload attendance sheet / PDF",
-        type=[
-            "pdf",
-            "png",
-            "jpg",
-            "jpeg",
-            "webp",
-        ],
-    )
-)
-
-
-if uploaded_file:
-    pages = (
-        uploaded_file_to_images(
-            uploaded_file
-        )
-    )
-
-    st.session_state.pages = (
-        pages
-    )
-
-    st.success(
-        f"Loaded {len(pages)} page(s)."
-    )
-
-    if st.button(
-        "🚀 Extract Attendance",
-        type="primary",
-        width="stretch",
-    ):
-        try:
-            ocr = load_ocr()
-        except Exception as exc:
-            st.error(
-                f"Could not start PaddleOCR: {exc}"
-            )
-            st.stop()
-
-        results = []
-
-        progress = (
-            st.progress(0)
-        )
-
-        status = st.empty()
-
-        for page_index, page in enumerate(
-            pages
-        ):
-            status.write(
-                f"Processing page "
-                f"{page_index + 1}/"
-                f"{len(pages)}..."
-            )
-
-            try:
-                prepared, _ = (
-                    preprocess(page)
-                )
-
-                first_words = (
-                    run_ocr(
-                        ocr,
-                        prepared,
-                    )
-                )
-
-                if force_attendance:
-                    document_type = (
-                        "attendance_sheet"
-                    )
-
-                elif use_ollama:
-                    detection = (
-                        detect_document_type(
-                            first_words,
-                            ollama_model,
-                        )
-                    )
-
-                    document_type = (
-                        detection.get(
-                            "document_type",
-                            "generic_table",
-                        )
-                    )
-
-                else:
-                    text = " ".join(
-                        item["text"].lower()
-                        for item
-                        in first_words
-                    )
-
-                    if (
-                        "attendance"
-                        in text
-                        or "absent"
-                        in text
-                    ):
-                        document_type = (
-                            "attendance_sheet"
-                        )
-                    else:
-                        document_type = (
-                            "generic_table"
-                        )
-
-                if (
-                    document_type
-                    == "attendance_sheet"
-                ):
-                    result = (
-                        extract_attendance_sheet(
-                            page,
-                            ocr,
-                        )
-                    )
-                else:
-                    result = (
-                        reconstruct_generic_grid(
-                            page,
-                            ocr,
-                        )
-                    )
-
-                result[
-                    "document_type"
-                ] = document_type
-
-                results.append(
-                    result
-                )
-
-            except Exception as exc:
-                st.error(
-                    f"Page "
-                    f"{page_index + 1} "
-                    f"failed: {exc}"
-                )
-
-                results.append(
-                    {
-                        "dataframe":
-                            pd.DataFrame(),
-                        "raw_words":
-                            [],
-                        "preview":
-                            page,
-                        "document_type":
-                            "failed",
-                    }
-                )
-
-            progress.progress(
-                (
-                    page_index + 1
-                )
-                / len(pages)
-            )
-
-        st.session_state.results = (
-            results
-        )
-
-        status.success(
-            "Extraction complete."
-        )
-
-
-# ============================================================
-# RESULTS
-# ============================================================
-
-if st.session_state.results:
-    st.divider()
-
-    valid_results = [
-        result
-        for result
-        in st.session_state.results
-        if not result[
-            "dataframe"
-        ].empty
-    ]
-
-    if not valid_results:
-        st.error(
-            "No usable attendance data was extracted."
-        )
-        st.stop()
-
-    st.header(
-        "Document Preview"
-    )
-
-    selected_page = (
-        st.selectbox(
-            "Page",
-            range(
-                1,
-                len(
-                    st.session_state.results
-                )
-                + 1
-            ),
-        )
-    )
-
-    index = (
-        selected_page - 1
-    )
-
-    selected_result = (
-        st.session_state.results[
-            index
-        ]
-    )
-
-    left, right = (
-        st.columns(2)
-    )
-
-    with left:
-        st.markdown(
-            "### Original"
-        )
-
-        st.image(
-            st.session_state.pages[
-                index
-            ],
-            width="stretch",
-        )
-
-    with right:
-        st.markdown(
-            "### Detected Structure"
-        )
-
-        if show_grid:
-            st.image(
-                selected_result[
-                    "preview"
-                ],
-                width="stretch",
-            )
-        else:
-            st.info(
-                "Structure preview disabled."
-            )
-
-    st.markdown(
-        f"**Document type:** "
-        f"`{selected_result['document_type']}`"
-    )
-
-    if (
-        "day_count"
-        in selected_result
-    ):
-        st.markdown(
-            f"**Detected day columns:** "
-            f"{selected_result['day_count']}"
-        )
-
-    with st.expander(
-        "Raw OCR"
-    ):
-        raw_df = pd.DataFrame(
-            [
-                {
-                    "Text":
-                        item["text"],
-                    "Confidence":
-                        item[
-                            "confidence"
-                        ],
-                    "Box":
-                        str(
-                            item["box"]
-                        ),
-                }
-                for item
-                in selected_result[
-                    "raw_words"
-                ]
-            ]
-        )
-
-        st.dataframe(
-            raw_df,
-            width="stretch",
-        )
-
-    # --------------------------------------------------------
-    # Combine pages
-    # --------------------------------------------------------
-
-    dataframes = [
-        result[
-            "dataframe"
-        ]
-        for result
-        in valid_results
-    ]
-
-    first_columns = list(
-        dataframes[0].columns
-    )
-
-    if all(
-        list(df.columns)
-        == first_columns
-        for df
-        in dataframes
-    ):
-        combined_df = pd.concat(
-            dataframes,
-            ignore_index=True,
-        )
-    else:
-        combined_df = (
-            dataframes[0]
-        )
-
-    # --------------------------------------------------------
-    # Editable table
-    # --------------------------------------------------------
-
-    st.header(
-        "Extracted Attendance"
+        "Use Ollama",
+        True,
     )
 
     st.caption(
-        "Review and correct OCR values before export."
+        "Ollama does not modify attendance values."
     )
 
-    edited_df = st.data_editor(
-        combined_df,
-        width="stretch",
-        height=650,
+
+uploaded = st.file_uploader(
+    "Upload attendance image or PDF",
+    type=[
+        "png",
+        "jpg",
+        "jpeg",
+        "webp",
+        "pdf",
+    ],
+)
+
+
+if uploaded:
+
+    pages = read_file(uploaded)
+
+    st.success(
+        f"{len(pages)} page(s) loaded"
+    )
+
+    page = st.selectbox(
+        "Preview page",
+        range(1, len(pages) + 1),
+    )
+
+    st_image_compat(
+        pages[page - 1],
+    )
+
+    if st_button_compat(
+        "🚀 Digitize",
+        type="primary",
+    ):
+
+        try:
+
+            with st.status(
+                "Loading OCR models... (first run downloads pretrained "
+                "weights, this can take a couple of minutes)",
+                expanded=True,
+            ) as status:
+
+                model = get_ocr(ocr_lang)
+
+                status.update(label="OCR models ready.")
+
+                frames = []
+                previews = []
+
+                progress = st.progress(0)
+
+                for i, image in enumerate(pages):
+
+                    status.update(
+                        label=f"Processing page {i + 1} of {len(pages)}..."
+                    )
+
+                    df, preview = extract_attendance(
+                        image,
+                        model,
+                        status=status,
+                    )
+
+                    frames.append(df)
+                    previews.append(preview)
+
+                    progress.progress(
+                        (i + 1) / len(pages)
+                    )
+
+                st.session_state["df"] = pd.concat(
+                    frames,
+                    ignore_index=True,
+                )
+
+                st.session_state["preview"] = previews
+
+                # Check if OCR extraction failed to get student info
+                df = st.session_state["df"]
+                if df is not None and len(df) > 0:
+                    empty_names = df["Student Full Name"].fillna("").str.strip().eq("").all()
+                    empty_serials = df["Serial No"].fillna("").str.strip().eq("").all()
+                    if empty_names and empty_serials:
+                        st.warning(
+                            "⚠️ **OCR extraction failed for student names and serial numbers.**\n\n"
+                            "The attendance grid was detected and attendance marks were extracted, "
+                            "but student information could not be recognized. "
+                            "Please manually enter the student names and serial numbers below."
+                        )
+
+                if use_ollama:
+
+                    status.update(label="Running Ollama cleanup pass...")
+
+                    info = ollama_cleanup(
+                        st.session_state["df"],
+                        model_name,
+                    )
+
+                    st.session_state["ollama"] = info
+
+                status.update(
+                    label="Done.",
+                    state="complete",
+                    expanded=False,
+                )
+
+        except Exception as e:
+
+            st.error(f"Extraction failed: {e}")
+
+            # IMPORTANT: gives exact traceback
+            st.exception(e)
+
+
+# ============================================================
+# RESULT
+# ============================================================
+
+if "df" in st.session_state:
+
+    st.divider()
+
+    if "preview" in st.session_state:
+
+        st.subheader("Detected Grid")
+
+        preview_page = st.selectbox(
+            "Grid page",
+            range(
+                1,
+                len(st.session_state["preview"]) + 1,
+            ),
+        )
+
+        st_image_compat(
+            st.session_state["preview"][
+                preview_page - 1
+            ],
+        )
+
+    if "ollama" in st.session_state:
+
+        info = st.session_state["ollama"]
+
+        st.info(
+            f"{info.get('document_type', 'attendance_sheet')} — "
+            f"{info.get('notes', '')}"
+        )
+
+    st.subheader("✏️ Review Attendance")
+
+    edited = st_data_editor_compat(
+        st.session_state["df"],
+        height=600,
         num_rows="dynamic",
-        key="attendance_editor",
-    )
-
-    # --------------------------------------------------------
-    # Attendance summary
-    # --------------------------------------------------------
-
-    day_columns = [
-        column
-        for column
-        in edited_df.columns
-        if str(column).isdigit()
-    ]
-
-    if day_columns:
-        summary = []
-
-        for row_index, row in (
-            edited_df.iterrows()
-        ):
-            marks = [
-                str(
-                    row[column]
-                ).strip()
-                for column
-                in day_columns
-            ]
-
-            marked = sum(
-                bool(value)
-                for value
-                in marks
-            )
-
-            absent = sum(
-                value.upper()
-                in {
-                    "A",
-                    "ABSENT",
-                }
-                for value
-                in marks
-            )
-
-            summary.append(
-                {
-                    "Student":
-                        row.get(
-                            "Student Full Name",
-                            f"Row {row_index + 1}",
-                        ),
-                    "Marked Days":
-                        marked,
-                    "Absent Days":
-                        absent,
-                    "Blank Days":
-                        len(day_columns)
-                        - marked,
-                }
-            )
-
-        st.subheader(
-            "Attendance Validation"
-        )
-
-        st.dataframe(
-            pd.DataFrame(
-                summary
-            ),
-            width="stretch",
-        )
-
-    # ========================================================
-    # PDF INFORMATION
-    # ========================================================
-
-    st.divider()
-
-    st.header(
-        "Printable PDF Information"
-    )
-
-    c1, c2, c3 = (
-        st.columns(3)
-    )
-
-    with c1:
-        school_name = (
-            st.text_input(
-                "School Name"
-            )
-        )
-
-        grade = (
-            st.text_input(
-                "Grade"
-            )
-        )
-
-        class_name = (
-            st.text_input(
-                "Class"
-            )
-        )
-
-    with c2:
-        zone = (
-            st.text_input(
-                "Zone"
-            )
-        )
-
-        district = (
-            st.text_input(
-                "District"
-            )
-        )
-
-        year = (
-            st.text_input(
-                "Year"
-            )
-        )
-
-    with c3:
-        teacher_name = (
-            st.text_input(
-                "Teacher Name"
-            )
-        )
-
-        month = (
-            st.text_input(
-                "Month"
-            )
-        )
-
-        working_days = (
-            st.text_input(
-                "No. of Working Days"
-            )
-        )
-
-    pdf_title = (
-        st.text_input(
-            "PDF Title",
-            value=
-                "ABSENCE RECORDING SHEET",
-        )
     )
 
     # ========================================================
-    # EXPORTS
+    # PDF DETAILS
     # ========================================================
 
-    st.divider()
+    st.subheader("PDF Information")
 
-    st.header(
-        "Export"
+    a, b, c = st.columns(3)
+
+    with a:
+        school = st.text_input(
+            "School Name"
+        )
+
+        grade = st.text_input(
+            "Grade"
+        )
+
+    with b:
+        class_name = st.text_input(
+            "Class"
+        )
+
+        teacher = st.text_input(
+            "Teacher"
+        )
+
+    with c:
+        month = st.text_input(
+            "Month"
+        )
+
+        year = st.text_input(
+            "Year"
+        )
+
+    title = st.text_input(
+        "PDF Title",
+        "ABSENCE RECORDING SHEET",
     )
 
-    excel_bytes = (
-        export_excel(
-            edited_df
-        )
+    # ========================================================
+    # EXPORT
+    # ========================================================
+
+    excel = make_excel(edited)
+
+    csv = edited.to_csv(
+        index=False
+    ).encode(
+        "utf-8-sig"
     )
 
-    csv_bytes = (
-        edited_df
-        .to_csv(
-            index=False
-        )
-        .encode(
-            "utf-8-sig"
-        )
+    pdf = make_pdf(
+        edited,
+        title,
+        school,
+        grade,
+        class_name,
+        teacher,
+        month,
+        year,
     )
 
-    pdf_bytes = (
-        export_attendance_pdf(
-            edited_df,
-            title=pdf_title,
-            school_name=
-                school_name,
-            grade=
-                grade,
-            class_name=
-                class_name,
-            zone=
-                zone,
-            district=
-                district,
-            year=
-                year,
-            teacher_name=
-                teacher_name,
-            month=
-                month,
-            working_days=
-                working_days,
-        )
-    )
+    x, y, z = st.columns(3)
 
-    col1, col2, col3 = (
-        st.columns(3)
-    )
+    with x:
 
-    with col1:
-        st.download_button(
-            "⬇️ Download Excel",
-            data=excel_bytes,
-            file_name=
-                "digitized_attendance.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            width="stretch",
+        st_download_button_compat(
+            "⬇️ Excel",
+            excel,
+            "attendance.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    with col2:
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv_bytes,
-            file_name=
-                "digitized_attendance.csv",
-            mime="text/csv",
-            width="stretch",
+    with y:
+
+        st_download_button_compat(
+            "⬇️ CSV",
+            csv,
+            "attendance.csv",
+            "text/csv",
         )
 
-    with col3:
-        st.download_button(
-            "⬇️ Download Printable PDF",
-            data=pdf_bytes,
-            file_name=
-                "attendance_recording_sheet.pdf",
-            mime="application/pdf",
-            width="stretch",
+    with z:
+
+        st_download_button_compat(
+            "⬇️ Printable PDF",
+            pdf,
+            "attendance.pdf",
+            "application/pdf",
         )

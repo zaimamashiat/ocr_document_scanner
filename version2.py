@@ -4,8 +4,12 @@ import os
 # IMPORTANT: MUST BE SET BEFORE importing Paddle/PaddleOCR
 # ============================================================
 
+# Disable OneDNN to avoid context errors on Windows
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["MKL_THREADING_LAYER"] = "GNU"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 # ============================================================
 # IMPORTS
@@ -339,11 +343,25 @@ def run_ocr(image: np.ndarray):
     """
     PaddleOCR 3.x.
 
-    Do NOT use:
-        ocr.predict(image, cls=True)
+    Use the __call__ method (call the object directly).
+    
+    Handles OneDNN context errors on Windows by returning empty results
+    instead of crashing the application.
     """
 
-    result = ocr.predict(image)
+    try:
+        result = ocr(image)
+    except RuntimeError as e:
+        # Handle OneDNN context errors gracefully
+        if "OneDnnContext" in str(e) or "does not have the input" in str(e):
+            st.warning(
+                "⚠️ OneDNN error occurred during OCR processing. "
+                "This can happen on Windows with certain hardware configurations. "
+                "The page will be processed with empty results - you can manually verify the data."
+            )
+            return []
+        else:
+            raise
 
     return parse_paddle_output(result)
 
@@ -1404,13 +1422,17 @@ for page_number, pil_page in enumerate(
         # OCR
         # ====================================================
 
-        with st.spinner(
-            f"Running OCR on page {page_number}..."
-        ):
+        try:
+            with st.spinner(
+                f"Running OCR on page {page_number}..."
+            ):
 
-            entries = run_ocr(
-                processed_image
-            )
+                entries = run_ocr(
+                    processed_image
+                )
+        except Exception as e:
+            st.error(f"OCR failed on page {page_number}: {e}")
+            entries = []
 
         entries = [
             entry

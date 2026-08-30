@@ -1,7 +1,11 @@
 streamlit
-opencv-python-headless
+opencv-python
 numpy
 pandas
+pypdfium2
 requests
-openpyxl
 Pillow
+paddlepaddle
+paddleocr
+openpyxl
+reportlab
